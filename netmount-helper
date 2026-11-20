@@ -1,0 +1,330 @@
+#!/usr/bin/python3 -I
+"""netmount-helper — montage/démontage privilégié pour netmount.
+
+Installé en root dans /usr/local/sbin/ et appelé via `sudo -n` (règle
+sudoers NOPASSWD limitée à ce seul fichier). Il ne fait confiance à
+aucun argument : les options de montage sont construites ici, le point
+de montage et le fichier d'identifiants doivent être dans le $HOME de
+l'utilisateur appelant, et uid/gid viennent de sudo (SUDO_UID/SUDO_GID).
+
+Usage :
+  netmount-helper check
+  netmount-helper mount cifs <hôte> <partage> <point_de_montage> [<fichier_identifiants>]
+  netmount-helper mount nfs  <hôte> <export>  <point_de_montage>
+  netmount-helper umount <point_de_montage> [force]
+  netmount-helper dhcp-scan <interface> [<secondes>]
+"""
+import ctypes
+import json
+import os
+import pwd
+import random
+import re
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,252}$")
+IFACE_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,15}$")
+NETFS = {"cifs", "smb3", "nfs", "nfs4"}
+STAGING = "/run/netmount-helper"
+MS_BIND = 0x1000
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def caller():
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if os.geteuid() != 0 or not uid or not gid:
+        die("doit être lancé via sudo")
+    pw = pwd.getpwuid(int(uid))
+    return int(uid), int(gid), os.path.realpath(pw.pw_dir)
+
+
+def safe_path(path, home):
+    """Résout le chemin sans jamais faire de stat sur la feuille (un
+    montage mort ferait bloquer le stat)."""
+    if not path.startswith("/") or "\n" in path or "," in path:
+        die(f"chemin refusé : {path!r}")
+    path = path.rstrip("/")
+    parent = os.path.realpath(os.path.dirname(path))
+    full = os.path.join(parent, os.path.basename(path))
+    if not full.startswith(home + "/") or full == home:
+        die(f"le point de montage doit être dans {home} : {full}")
+    return full
+
+
+def unescape(s):
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
+
+
+def mounted_fstype(mp):
+    with open("/proc/self/mounts") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3 and unescape(parts[1]) == mp:
+                return parts[2]
+    return None
+
+
+def run(cmd, timeout=25):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        die("délai dépassé : " + " ".join(cmd), 3)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode != 0:
+        die(out or f"échec ({r.returncode})", r.returncode or 1)
+    if out:
+        print(out)
+
+
+def open_mountpoint(mp, uid, home):
+    """Ouvre le dossier de montage et vérifie l'objet ouvert, pas son nom :
+    un lien symbolique ou un dossier échangé après coup ne peut pas faire
+    monter le partage ailleurs que dans le $HOME de l'utilisateur."""
+    try:
+        fd = os.open(mp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        die(f"dossier refusé : {mp} ({exc.strerror})")
+    real = os.readlink(f"/proc/self/fd/{fd}")
+    if not real.startswith(home + "/"):
+        die(f"le point de montage doit être dans {home} : {real}")
+    if os.fstat(fd).st_uid != uid:
+        die(f"le dossier doit appartenir à l'utilisateur : {real}")
+    return fd
+
+
+def staging_dir():
+    os.makedirs(STAGING, mode=0o700, exist_ok=True)
+    os.chmod(STAGING, 0o700)
+    return STAGING
+
+
+def mount_at(fd, mount_cmd):
+    """Monte d'abord dans un dossier root (mount.cifs/mount.nfs travaillent
+    sur des noms de chemin), puis le rattache par bind au dossier ouvert via
+    /proc/self/fd, ce qui désigne exactement le dossier vérifié."""
+    staging = tempfile.mkdtemp(dir=staging_dir())
+    try:
+        run(mount_cmd(staging))
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.mount(staging.encode(), f"/proc/self/fd/{fd}".encode(),
+                          None, MS_BIND, None) != 0:
+                err = ctypes.get_errno()
+                die(f"bind impossible : {os.strerror(err)}", 1)
+        finally:
+            subprocess.run(["/bin/umount", "-l", staging], capture_output=True, timeout=15)
+    finally:
+        os.rmdir(staging)
+
+
+def do_mount(args, uid, gid, home):
+    if len(args) not in (4, 5):
+        die(__doc__)
+    fstype, host, share, mp = args[:4]
+    if not HOST_RE.match(host):
+        die(f"hôte refusé : {host!r}")
+    mp = safe_path(mp, home)
+    if mounted_fstype(mp):
+        print("déjà monté")
+        return
+    fd = open_mountpoint(mp, uid, home)
+
+    if fstype == "cifs":
+        if not share or any(c in share for c in "/\\,\n\0"):
+            die(f"partage refusé : {share!r}")
+        opts = [f"uid={uid}", f"gid={gid}", "forceuid", "forcegid", "nosuid", "nodev",
+                "file_mode=0664", "dir_mode=0775", "iocharset=utf8", "soft",
+                "echo_interval=5", "nobrl"]
+        if len(args) == 5:
+            cred = safe_path(args[4], home)
+            try:
+                cfd = os.open(cred, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except OSError as exc:
+                die(f"fichier d'identifiants illisible : {cred} ({exc.strerror})")
+            st = os.fstat(cfd)
+            if st.st_uid != uid or st.st_mode & 0o077:
+                die("le fichier d'identifiants doit appartenir à l'utilisateur, en mode 600")
+            with os.fdopen(cfd) as f:
+                creds = f.read()
+            # copie privée : mount.cifs ne relit pas un nom que l'utilisateur pourrait échanger
+            tmp_fd, tmp_cred = tempfile.mkstemp(dir=staging_dir())
+            with os.fdopen(tmp_fd, "w") as f:
+                f.write(creds)
+            opts.append(f"credentials={tmp_cred}")
+        else:
+            tmp_cred = None
+            opts.append("guest")
+        try:
+            mount_at(fd, lambda target: ["/sbin/mount.cifs", f"//{host}/{share}", target,
+                                         "-o", ",".join(opts)])
+        finally:
+            if tmp_cred:
+                os.unlink(tmp_cred)
+    elif fstype == "nfs":
+        if not share.startswith("/") or any(c in share for c in ",\n\0"):
+            die(f"export refusé : {share!r}")
+        opts = "soft,timeo=50,retrans=2,nosuid,nodev"
+        mount_at(fd, lambda target: ["/sbin/mount.nfs", f"{host}:{share}", target, "-o", opts])
+    else:
+        die(f"type inconnu : {fstype}")
+
+
+def do_umount(args, home):
+    if not args:
+        die(__doc__)
+    mp = safe_path(args[0], home)
+    fs = mounted_fstype(mp)
+    if fs is None:
+        print("pas monté")
+        return
+    if fs not in NETFS:
+        die(f"{mp} n'est pas un montage réseau ({fs})")
+    force = len(args) > 1 and args[1] == "force"
+    if not force:
+        r = subprocess.run(["/bin/umount", mp], capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return
+    # serveur parti ou dossier occupé : démontage paresseux et forcé, ne bloque pas
+    run(["/bin/umount", "-f", "-l", mp], timeout=15)
+
+
+def _checksum(b):
+    if len(b) % 2:
+        b += b"\0"
+    s = sum(struct.unpack(f"!{len(b) // 2}H", b))
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return ~s & 0xFFFF
+
+
+def _ip_list(b):
+    return [socket.inet_ntoa(b[i:i + 4]) for i in range(0, len(b) - 3, 4)]
+
+
+def _dhcp_options(b):
+    out, i = {}, 0
+    while i + 1 < len(b) and b[i] != 255:
+        if b[i] == 0:
+            i += 1
+            continue
+        out[b[i]] = b[i + 2:i + 2 + b[i + 1]]
+        i += 2 + b[i + 1]
+    return out
+
+
+def do_dhcp_scan(args):
+    """Envoie des DHCPDISCOVER (vraie MAC de l'interface, flag broadcast) et
+    liste toutes les DHCPOFFER reçues : plus d'un serveur = DHCP en double.
+    Rien n'est accepté (pas de DHCPREQUEST), la config réseau ne change pas."""
+    if len(args) not in (1, 2):
+        die(__doc__)
+    iface = args[0]
+    sysdir = f"/sys/class/net/{iface}"
+    if not IFACE_RE.match(iface) or iface == "lo" or not os.path.isdir(sysdir):
+        die(f"interface refusée : {iface!r}")
+    try:
+        duration = min(max(int(args[1]), 3), 30) if len(args) == 2 else 10
+    except ValueError:
+        die(f"durée refusée : {args[1]!r}")
+    with open(f"{sysdir}/type") as f:
+        if f.read().strip() != "1":     # ARPHRD_ETHER (Ethernet et Wi-Fi)
+            die(f"{iface} n'est pas une interface Ethernet/Wi-Fi")
+    with open(f"{sysdir}/address") as f:
+        mac = bytes.fromhex(f.read().strip().replace(":", ""))
+
+    xid = random.getrandbits(32)
+    bootp = struct.pack("!BBBBIHH4s4s4s4s16s64s128s", 1, 1, 6, 0, xid, 0, 0x8000,
+                        bytes(4), bytes(4), bytes(4), bytes(4), mac + bytes(10), b"", b"")
+    opts = (b"\x63\x82\x53\x63" + bytes([53, 1, 1]) + bytes([61, 7, 1]) + mac
+            + bytes([55, 5, 1, 3, 6, 15, 51]) + b"\xff")
+    udp = struct.pack("!HHHH", 68, 67, 8 + len(bootp) + len(opts), 0) + bootp + opts
+    ip = bytearray(struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0, 64, 17, 0,
+                               bytes(4), b"\xff" * 4))
+    ip[10:12] = struct.pack("!H", _checksum(bytes(ip)))
+    frame = b"\xff" * 6 + mac + b"\x08\x00" + bytes(ip) + udp
+
+    try:
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+        sock.bind((iface, 0))
+    except OSError as exc:
+        die(f"socket {iface} : {exc}")
+
+    offers, seen, sent = [], set(), 0
+    deadline = time.time() + duration
+    next_send = 0.0
+    while time.time() < deadline:
+        if sent < 3 and time.time() >= next_send:
+            try:
+                sock.send(frame)
+            except OSError as exc:
+                die(f"envoi sur {iface} impossible : {exc}")
+            sent += 1
+            next_send = time.time() + 3
+        wake = min(deadline, next_send) if sent < 3 else deadline
+        sock.settimeout(max(0.1, wake - time.time()))
+        try:
+            data = sock.recv(4096)
+        except socket.timeout:
+            continue
+        if len(data) < 14 + 20 + 8 + 240 or data[23] != 17:
+            continue
+        udp_off = 14 + (data[14] & 0x0F) * 4
+        if struct.unpack("!H", data[udp_off + 2:udp_off + 4])[0] != 68:
+            continue
+        bp = data[udp_off + 8:]
+        if (len(bp) < 240 or bp[0] != 2 or struct.unpack("!I", bp[4:8])[0] != xid
+                or bp[236:240] != b"\x63\x82\x53\x63"):
+            continue
+        o = _dhcp_options(bp[240:])
+        if o.get(53, b"\0")[:1] != b"\x02":     # DHCPOFFER uniquement
+            continue
+        src_mac = ":".join(f"{x:02x}" for x in data[6:12])
+        src_ip = socket.inet_ntoa(data[26:30])
+        server = socket.inet_ntoa(o[54]) if len(o.get(54, b"")) == 4 else src_ip
+        if (src_mac, server) in seen:
+            continue
+        seen.add((src_mac, server))
+        offers.append({
+            "server": server,
+            "src_ip": src_ip,
+            "src_mac": src_mac,
+            "offered": socket.inet_ntoa(bp[16:20]),
+            "mask": _ip_list(o.get(1, b"")),
+            "router": _ip_list(o.get(3, b"")),
+            "dns": _ip_list(o.get(6, b"")),
+            "lease": struct.unpack("!I", o[51])[0] if len(o.get(51, b"")) == 4 else None,
+        })
+    sock.close()
+    print(json.dumps({"iface": iface, "mac": ":".join(f"{x:02x}" for x in mac),
+                      "sent": sent, "duration": duration, "offers": offers}))
+
+
+def main():
+    if len(sys.argv) < 2:
+        die(__doc__)
+    cmd, args = sys.argv[1], sys.argv[2:]
+    uid, gid, home = caller()
+    if cmd == "check":
+        print("ok")
+    elif cmd == "mount":
+        do_mount(args, uid, gid, home)
+    elif cmd == "umount":
+        do_umount(args, home)
+    elif cmd == "dhcp-scan":
+        do_dhcp_scan(args)
+    else:
+        die(__doc__)
+
+
+if __name__ == "__main__":
+    main()
