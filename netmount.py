@@ -9,6 +9,9 @@ applications.
   python3 netmount.py          ouvre la fenêtre
   python3 netmount.py --tray   démarre caché dans la zone de notification
 
+Mise à jour : bouton « Mettre à jour… » (git fetch + merge --ff-only depuis
+GitHub, puis redémarrage) ; le programme doit avoir été installé par git clone.
+
 Les opérations root passent par /usr/local/sbin/netmount-helper (voir
 install.sh), appelé via `sudo -n`.
 """
@@ -26,7 +29,7 @@ import warnings
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Gio, GLib, Gtk, Pango  # noqa: E402
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -192,6 +195,42 @@ def dhcp_scan(iface, seconds):
     return None, msg or "échec du scan"
 
 
+# --------------------------------------------------------------- mise à jour
+
+def git(*args, timeout=30):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    r = subprocess.run(["git", "-C", HERE, *args], capture_output=True, text=True,
+                       timeout=timeout, env=env)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or r.stdout.strip() or f"git {args[0]} a échoué")
+    return r.stdout.strip()
+
+
+def current_version():
+    try:
+        return git("log", "-1", "--format=%h du %cd", "--date=format:%d/%m/%Y", timeout=5)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return None
+
+
+def pending_updates():
+    """Récupère GitHub et renvoie les titres des commits pas encore appliqués."""
+    if not os.path.exists(os.path.join(HERE, ".git")):
+        raise RuntimeError("programme installé sans git : le réinstaller avec "
+                           "« git clone » pour pouvoir le mettre à jour.")
+    git("fetch", "--quiet")
+    return git("log", "--format=%s", "HEAD..@{u}").splitlines()
+
+
+def helper_outdated():
+    """Vrai si le helper installé diffère de celui du programme."""
+    try:
+        with open(HELPER, "rb") as a, open(os.path.join(HERE, "netmount-helper"), "rb") as b:
+            return a.read() != b.read()
+    except OSError:
+        return False
+
+
 # --------------------------------------------------------------- config
 
 def load_config():
@@ -240,6 +279,7 @@ class Monitor(threading.Thread):
         self.busy = threading.Lock()
         self.last_fail = {}   # id -> (heure, message)
         self.has_helper = False
+        self.helper_stale = False
         self.recheck_helper = True   # sudo -n journalise chaque appel : on ne vérifie pas à chaque cycle
         # Mode départ : tout est démonté proprement tant que les serveurs sont
         # encore là ; il se désactive tout seul quand plus aucun ne répond.
@@ -258,6 +298,7 @@ class Monitor(threading.Thread):
             entries = self.app.snapshot()
             if self.recheck_helper:
                 self.has_helper = helper_installed()
+                self.helper_stale = self.has_helper and helper_outdated()
                 self.recheck_helper = False
             has_helper = self.has_helper
             results = {}
@@ -268,7 +309,7 @@ class Monitor(threading.Thread):
                     results[e["id"]] = ("err", str(exc))
             if self.leaving and not any(s == "leave" for s, _ in results.values()):
                 self.leaving = False   # serveurs disparus : on est parti, reprise auto
-            GLib.idle_add(self.app.on_status, results, has_helper)
+            GLib.idle_add(self.app.on_status, results, has_helper, self.helper_stale)
 
     def handle(self, e, has_helper):
         mounted = is_mounted(e["mountpoint"])
@@ -570,8 +611,11 @@ class DhcpDialog(Gtk.Dialog):
 # --------------------------------------------------------------- fenêtre principale
 
 class App(Gtk.Application):
-    def __init__(self, start_hidden):
-        super().__init__(application_id=APP_ID)
+    def __init__(self, start_hidden, replace=False):
+        flags = Gio.ApplicationFlags.ALLOW_REPLACEMENT
+        if replace:     # redémarrage après mise à jour : prend la place de l'ancienne instance
+            flags |= Gio.ApplicationFlags.REPLACE
+        super().__init__(application_id=APP_ID, flags=flags)
         self.start_hidden = start_hidden
         self.cfg = load_config()
         self.cfg_lock = threading.Lock()
@@ -605,9 +649,7 @@ class App(Gtk.Application):
         if self.start_hidden and self.tray:
             self.start_hidden = False
             return
-        self.win.show_all()
-        self.infobar.set_visible(not self.helper_ok)
-        self.win.present()
+        self.show_window()
 
     def quit_all(self, *_):
         """Quitter = démonter tout ce qu'on a monté, pour ne rien laisser de mort derrière."""
@@ -626,15 +668,15 @@ class App(Gtk.Application):
         self.win.set_icon_name("folder-remote")
         self.win.connect("delete-event", self.on_close)
         self.helper_ok = True
+        self.helper_stale = False
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=10)
         self.win.add(box)
 
         self.infobar = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING)
-        self.infobar.get_content_area().add(Gtk.Label(
-            label="L'autorisation de montage n'est pas installée : "
-                  "rien ne peut être monté pour l'instant.", wrap=True, xalign=0))
-        self.infobar.add_button("Installer (mot de passe admin)", 1)
+        self.infobar_lbl = Gtk.Label(wrap=True, xalign=0)
+        self.infobar.get_content_area().add(self.infobar_lbl)
+        self.infobar_btn = self.infobar.add_button("", 1)
         self.infobar.connect("response", self.on_install)
         box.pack_start(self.infobar, False, False, 0)
 
@@ -685,10 +727,19 @@ class App(Gtk.Application):
         self.leave_msg.set_no_show_all(True)
         box.pack_start(self.leave_msg, False, False, 0)
 
+        bottom = Gtk.Box(spacing=10)
         self.autostart = Gtk.CheckButton(label="Lancer automatiquement à l'ouverture de session")
         self.autostart.set_active(os.path.exists(AUTOSTART))
         self.autostart.connect("toggled", self.on_autostart)
-        box.pack_start(self.autostart, False, False, 0)
+        bottom.pack_start(self.autostart, False, False, 0)
+        self.update_btn = Gtk.Button(label="Mettre à jour…")
+        self.update_btn.set_tooltip_text("Cherche une nouvelle version sur GitHub")
+        self.update_btn.connect("clicked", self.on_update)
+        bottom.pack_end(self.update_btn, False, False, 0)
+        version = Gtk.Label(label=f"Version {current_version() or 'inconnue'}")
+        version.get_style_context().add_class("dim-label")
+        bottom.pack_end(version, False, False, 0)
+        box.pack_start(bottom, False, False, 0)
         self.update_leave()
         self.refresh()
 
@@ -717,8 +768,19 @@ class App(Gtk.Application):
 
     def show_window(self):
         self.win.show_all()
-        self.infobar.set_visible(not self.helper_ok)
+        self.update_infobar()
         self.win.present()
+
+    def update_infobar(self):
+        if not self.helper_ok:
+            self.infobar_lbl.set_text("L'autorisation de montage n'est pas installée : "
+                                      "rien ne peut être monté pour l'instant.")
+            self.infobar_btn.set_label("Installer (mot de passe admin)")
+        elif self.helper_stale:
+            self.infobar_lbl.set_text("L'autorisation de montage installée est d'une ancienne "
+                                      "version : la mettre à jour.")
+            self.infobar_btn.set_label("Mettre à jour (mot de passe admin)")
+        self.infobar.set_visible(not self.helper_ok or self.helper_stale)
 
     def toggle_window(self):
         if self.win.get_visible():
@@ -750,11 +812,12 @@ class App(Gtk.Application):
                 if row[1] == sel:
                     self.view.get_selection().select_iter(row.iter)
 
-    def on_status(self, results, has_helper):
+    def on_status(self, results, has_helper, helper_stale):
         self.status.update(results)
         self.helper_ok = has_helper
+        self.helper_stale = helper_stale
         if self.win.get_visible():
-            self.infobar.set_visible(not has_helper)
+            self.update_infobar()
         self.refresh()
         self.update_leave()
         if self.tray:
@@ -892,6 +955,64 @@ class App(Gtk.Application):
         self.monitor.recheck_helper = True
         self.monitor.wake.set()
 
+    def on_update(self, *_):
+        self.update_btn.set_sensitive(False)
+        self.update_btn.set_label("Recherche…")
+
+        def work():
+            try:
+                res = (pending_updates(), None)
+            except subprocess.TimeoutExpired:
+                res = (None, "GitHub ne répond pas (délai dépassé).")
+            except (OSError, RuntimeError) as exc:
+                res = (None, str(exc))
+            GLib.idle_add(self.update_checked, *res)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def update_checked(self, commits, err):
+        self.update_btn.set_sensitive(True)
+        self.update_btn.set_label("Mettre à jour…")
+        if err:
+            self.error(self.win, "Impossible de chercher les mises à jour.\n\n" + err)
+            return False
+        if not commits:
+            self.error(self.win, "Le programme est déjà à jour.", Gtk.MessageType.INFO)
+            return False
+        shown = "\n".join("• " + c for c in commits[:15])
+        if len(commits) > 15:
+            shown += f"\n… et {len(commits) - 15} autre(s)"
+        d = Gtk.MessageDialog(transient_for=self.win, modal=True,
+                              message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.YES_NO,
+                              text=f"{len(commits)} modification(s) disponible(s). "
+                                   "Mettre à jour et redémarrer ?")
+        d.format_secondary_text(shown + "\n\nLes partages montés le restent.")
+        ok = d.run() == Gtk.ResponseType.YES
+        d.destroy()
+        if ok:
+            self.apply_update()
+        return False
+
+    def apply_update(self):
+        try:
+            git("merge", "--ff-only", "@{u}")
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            self.error(self.win, "Mise à jour impossible (fichiers modifiés localement ?).\n\n"
+                       + str(exc))
+            return
+        if self.helper_ok and helper_outdated():
+            self.on_install(None, None)
+        self.restart()
+
+    def restart(self):
+        """Relance la nouvelle version à la place de celle-ci (les montages restent)."""
+        self.monitor.stopping = True
+        self.monitor.wake.set()
+        self.monitor.busy.acquire()     # n'interrompt pas un montage en cours
+        script = os.path.join(HERE, "netmount.py")
+        os.execv(sys.executable, [sys.executable, script, "--replace"])
+
     def on_autostart(self, btn):
         if btn.get_active():
             self.write_desktop(AUTOSTART, extra="--tray")
@@ -912,9 +1033,9 @@ class App(Gtk.Application):
                     "Categories=System;Network;\n")
 
     @staticmethod
-    def error(parent, msg):
+    def error(parent, msg, kind=Gtk.MessageType.WARNING):
         d = Gtk.MessageDialog(transient_for=parent, modal=True,
-                              message_type=Gtk.MessageType.WARNING,
+                              message_type=kind,
                               buttons=Gtk.ButtonsType.OK, text=msg)
         d.run()
         d.destroy()
@@ -922,7 +1043,7 @@ class App(Gtk.Application):
 
 def main():
     hidden = "--tray" in sys.argv
-    app = App(hidden)
+    app = App(hidden, replace="--replace" in sys.argv)
     return app.run([sys.argv[0]])
 
 
